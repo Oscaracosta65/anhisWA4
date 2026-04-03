@@ -1,0 +1,2200 @@
+<?php
+/**
+ * LottoExpert.net — Pick 10 / 80 Results Intelligence Page
+ * Joomla 5.x + PHP 8.1+
+ *
+ * GAME: Pick 10 / 80 — 20 numbers drawn from a pool of 01–80
+ * GAME IDs: WA4 | IN7 | IN9 (dynamic from upstream)
+ * MAIN BALLS: 20 drawn positions (first … twentieth)
+ * NUMBER RANGE: 01–80
+ * NO BONUS BALL
+ *
+ * ASSUMES UPSTREAM VARIABLES:
+ * - $stateName
+ * - $stateAbrev
+ * - $gName
+ * - $dbCol
+ * - $gId
+ */
+
+defined('_JEXEC') or die;
+
+use Joomla\CMS\Factory;
+use Joomla\CMS\HTML\HTMLHelper;
+use Joomla\CMS\Session\Session;
+use Joomla\CMS\Uri\Uri;
+
+$app   = Factory::getApplication();
+$doc   = Factory::getDocument();
+$input = $app->input;
+$db    = Factory::getDbo();
+$user  = Factory::getUser();
+
+// ── Game config from upstream ────────────────────────────────────────────────
+$gameId         = isset($gId)        ? trim((string) $gId)        : '';
+$dbColSafe      = isset($dbCol)      ? trim((string) $dbCol)      : '';
+$stateNameSafe  = isset($stateName)  ? (string) $stateName        : '';
+$stateAbrevSafe = isset($stateAbrev) ? (string) $stateAbrev       : '';
+$gNameSafe      = isset($gName)      ? (string) $gName            : '';
+
+// DB column names for the 20 drawn positions (preserving original schema spelling)
+$p10Cols = [
+    'first',       'second',      'third',       'fourth',      'fifth',
+    'sixth',       'seventh',     'eighth',      'nineth',      'tenth',
+    'eleventh',    'twelveth',    'thirtheenth', 'fourteenth',  'fifteenth',
+    'sixteenth',   'seventeenth', 'eighteenth',  'nineteenth',  'twentieth',
+];
+
+// ── SEO / Document ────────────────────────────────────────────────────────────
+$uri              = Uri::getInstance();
+$canonicalNoQuery = $uri->toString(['scheme', 'host', 'port', 'path']);
+
+$doc->addCustomTag('<link rel="canonical" href="' . htmlspecialchars($canonicalNoQuery, ENT_QUOTES, 'UTF-8') . '" />');
+$doc->addCustomTag('<link rel="alternate" hreflang="en" href="' . htmlspecialchars($canonicalNoQuery, ENT_QUOTES, 'UTF-8') . '" />');
+$doc->addCustomTag('<link rel="alternate" hreflang="x-default" href="' . htmlspecialchars($canonicalNoQuery, ENT_QUOTES, 'UTF-8') . '" />');
+
+if ($stateNameSafe !== '' && $gNameSafe !== '') {
+    $doc->setTitle('Results Intelligence — ' . $stateNameSafe . ' ' . $gNameSafe . ' | LottoExpert.net');
+    $doc->setMetaData(
+        'description',
+        $stateNameSafe . ' ' . $gNameSafe . ' results analysis — frequency, recency, active and quiet number trends for Pick 10/80 draws. Analytical context for informed review at LottoExpert.net.'
+    );
+}
+
+// ── User / session ────────────────────────────────────────────────────────────
+$loginStatus = (int) ($user->guest ?? 1);
+
+if ($loginStatus === 1) {
+    $session     = Factory::getSession();
+    $userSession = $session->getId();
+} else {
+    $userId       = (int) $user->id;
+    $profileQuery = $db->getQuery(true)
+        ->select($db->quoteName('profile_value'))
+        ->from($db->quoteName('#__user_profiles'))
+        ->where($db->quoteName('profile_key') . ' = ' . $db->quote('profile.phone'))
+        ->where($db->quoteName('user_id') . ' = ' . (int) $userId);
+    $db->setQuery($profileQuery);
+    $userPhone = (string) $db->loadResult();
+    if ($userPhone !== '') {
+        $userPhone = str_replace('"', '', $userPhone);
+        $userPhone = str_replace('(', '', $userPhone);
+        $userPhone = str_replace(')', '-', $userPhone);
+    } else {
+        $userPhone = 'NULL';
+    }
+}
+
+// ── Helper functions ──────────────────────────────────────────────────────────
+
+function p10FmtDate(?string $date): string
+{
+    if (!$date) {
+        return '';
+    }
+    $ts = strtotime($date);
+    return ($ts === false) ? '' : date('m-d-Y', $ts);
+}
+
+function p10FmtDateLong(?string $date): string
+{
+    if (!$date) {
+        return '—';
+    }
+    $ts = strtotime($date);
+    return ($ts === false) ? '—' : date('F j, Y', $ts);
+}
+
+function p10Pad2(string $value): string
+{
+    $value = trim((string) $value);
+    if ($value === '') {
+        return '';
+    }
+    if (ctype_digit($value) && (int) $value < 10) {
+        return str_pad($value, 2, '0', STR_PAD_LEFT);
+    }
+    return $value;
+}
+
+function p10ResolveLogo(string $stateAbrev, string $gName): array
+{
+    $stateSlug   = strtolower(trim($stateAbrev));
+    $lotterySlug = strtolower(trim($gName));
+    $lotterySlug = str_replace(' ', '-', $lotterySlug);
+    $rel = '/images/lottodb/us/' . $stateSlug . '/' . $lotterySlug . '.png';
+    $abs = rtrim(JPATH_ROOT, DIRECTORY_SEPARATOR) . $rel;
+    return is_file($abs) ? ['url' => $rel, 'exists' => true] : ['url' => '', 'exists' => false];
+}
+
+function p10InitRange(int $min, int $max): array
+{
+    $counts        = [];
+    $lastSeenIndex = [];
+    for ($i = $min; $i <= $max; $i++) {
+        $key                 = ($i < 10) ? '0' . $i : (string) $i;
+        $counts[$key]        = 0;
+        $lastSeenIndex[$key] = null;
+    }
+    return [$counts, $lastSeenIndex];
+}
+
+function p10DrawingsAgoLabel(?int $idx, int $window): array
+{
+    if ($idx === null) {
+        return [$window + 1, 'Not in last ' . $window . ' drws'];
+    }
+    if ($idx === 0) {
+        return [1, 'In last drw'];
+    }
+    return [$idx + 1, ($idx + 1) . ' drws ago'];
+}
+
+function p10BuildLabels(int $min, int $max): array
+{
+    $labels = [];
+    for ($i = $min; $i <= $max; $i++) {
+        $labels[] = ($i < 10) ? '0' . $i : (string) $i;
+    }
+    return $labels;
+}
+
+function p10TopKeys(array $counts, int $limit, bool $ascending = false): array
+{
+    $work = $counts;
+    $ascending ? asort($work, SORT_NUMERIC) : arsort($work, SORT_NUMERIC);
+    return array_slice(array_keys($work), 0, $limit);
+}
+
+function p10CommaList(array $items): string
+{
+    $items = array_values(array_filter(array_map('trim', $items), static function ($v) {
+        return $v !== '';
+    }));
+    return empty($items) ? '—' : implode(', ', $items);
+}
+
+function p10FetchDraws(
+    \Joomla\Database\DatabaseDriver $db,
+    string $dbCol,
+    string $gameId,
+    int $limit,
+    array $cols
+): array {
+    $selectCols = [
+        $db->quoteName('id'),
+        $db->quoteName('draw_date'),
+        $db->quoteName('next_draw_date'),
+        $db->quoteName('next_jackpot'),
+    ];
+    foreach ($cols as $col) {
+        $selectCols[] = $db->quoteName($col);
+    }
+    $query = $db->getQuery(true)
+        ->select($selectCols)
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+        ->order($db->quoteName('draw_date') . ' DESC');
+    $db->setQuery($query, 0, $limit);
+    $rows = $db->loadAssocList();
+    return is_array($rows) ? $rows : [];
+}
+
+function p10ExtractBalls(array $row, array $cols): array
+{
+    $balls = [];
+    foreach ($cols as $col) {
+        $v       = trim((string) ($row[$col] ?? ''));
+        $balls[] = p10Pad2($v);
+    }
+    return $balls;
+}
+
+function p10FindRepeated(array $latestBalls, array $previousRows, array $cols): array
+{
+    $repeated = [];
+    foreach ($previousRows as $row) {
+        $prevBalls = p10ExtractBalls($row, $cols);
+        foreach ($latestBalls as $ball) {
+            if ($ball !== '' && in_array($ball, $prevBalls, true) && !in_array($ball, $repeated, true)) {
+                $repeated[] = $ball;
+            }
+        }
+    }
+    sort($repeated, SORT_NATURAL);
+    return $repeated;
+}
+
+function p10GetPrevDate(
+    \Joomla\Database\DatabaseDriver $db,
+    string $dbCol,
+    string $gameId,
+    string $drawDate,
+    string $ball,
+    array $cols
+): ?string {
+    if ($ball === '') {
+        return null;
+    }
+    $query = $db->getQuery(true)
+        ->select('MAX(' . $db->quoteName('draw_date') . ')')
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+        ->where($db->quoteName('draw_date') . ' < ' . $db->quote($drawDate));
+    $orParts = [];
+    foreach ($cols as $col) {
+        $orParts[] = $db->quoteName($col) . ' = ' . $db->quote($ball);
+    }
+    $query->where('(' . implode(' OR ', $orParts) . ')');
+    $db->setQuery($query);
+    $result = $db->loadResult();
+    return $result ? (string) $result : null;
+}
+
+function p10GetDrawsSince(
+    \Joomla\Database\DatabaseDriver $db,
+    string $dbCol,
+    string $gameId,
+    ?string $previousDate,
+    string $currentDate
+): ?int {
+    if (!$previousDate || !$currentDate) {
+        return null;
+    }
+    $query = $db->getQuery(true)
+        ->select('COUNT(' . $db->quoteName('id') . ')')
+        ->from($db->quoteName($dbCol))
+        ->where($db->quoteName('game_id') . ' = ' . $db->quote($gameId))
+        ->where($db->quoteName('draw_date') . ' > ' . $db->quote($previousDate))
+        ->where($db->quoteName('draw_date') . ' < ' . $db->quote($currentDate));
+    $db->setQuery($query);
+    return ((int) $db->loadResult()) + 1;
+}
+
+// ── Inputs ────────────────────────────────────────────────────────────────────
+$nodDefault = 100;
+$nodCurrent = $nodDefault;
+
+if ($input->getMethod() === 'POST' && Session::checkToken()) {
+    if ($input->post->get('fq-search', null, 'cmd') !== null) {
+        $nodCurrent = (int) $input->post->get('nod', $nodDefault, 'int');
+    }
+}
+
+$nodCurrent = max(10, min(700, $nodCurrent));
+
+// ── Fetch latest draw ─────────────────────────────────────────────────────────
+$latestRows = p10FetchDraws($db, $dbColSafe, $gameId, 1, $p10Cols);
+$lr         = !empty($latestRows) ? $latestRows[0] : null;
+
+$drawDate     = $lr ? (string) ($lr['draw_date']      ?? '') : '';
+$nextDrawDate = $lr ? (string) ($lr['next_draw_date'] ?? '') : '';
+$nextJackpot  = $lr ? (string) ($lr['next_jackpot']   ?? '') : '';
+
+$latestBalls = $lr ? p10ExtractBalls($lr, $p10Cols) : array_fill(0, 20, '');
+$logo        = p10ResolveLogo($stateAbrevSafe, $gNameSafe);
+
+// ── Fetch analysis window ─────────────────────────────────────────────────────
+$rowsMain = p10FetchDraws($db, $dbColSafe, $gameId, $nodCurrent, $p10Cols);
+
+[$mainCounts, $mainLastIdx] = p10InitRange(1, 80);
+
+foreach ($rowsMain as $idx => $row) {
+    foreach (p10ExtractBalls($row, $p10Cols) as $ball) {
+        if ($ball === '' || !isset($mainCounts[$ball])) {
+            continue;
+        }
+        $mainCounts[$ball]++;
+        if ($mainLastIdx[$ball] === null) {
+            $mainLastIdx[$ball] = (int) $idx;
+        }
+    }
+}
+
+// ── Chart / analysis data ─────────────────────────────────────────────────────
+$mainLabels        = p10BuildLabels(1, 80);
+$mainChartValues   = [];
+$mainRecencyValues = [];
+
+foreach ($mainLabels as $label) {
+    $mainChartValues[]   = (int) ($mainCounts[$label] ?? 0);
+    $mainRecencyValues[] = ($mainLastIdx[$label] === null)
+        ? ($nodCurrent + 1)
+        : ((int) $mainLastIdx[$label] + 1);
+}
+
+$topActiveKeys   = p10TopKeys($mainCounts, 10, false);
+$topActiveLabels = $topActiveKeys;
+$topActiveValues = [];
+foreach ($topActiveKeys as $k) {
+    $topActiveValues[] = (int) ($mainCounts[$k] ?? 0);
+}
+
+$quietCandidates = [];
+foreach ($mainCounts as $k => $cnt) {
+    $quietCandidates[$k] = ($mainLastIdx[$k] === null) ? ($nodCurrent + 1) : ((int) $mainLastIdx[$k] + 1);
+}
+arsort($quietCandidates, SORT_NUMERIC);
+
+$quietestKeys   = array_slice(array_keys($quietCandidates), 0, 10);
+$quietestLabels = $quietestKeys;
+$quietestValues = [];
+foreach ($quietestKeys as $k) {
+    $quietestValues[] = (int) $quietCandidates[$k];
+}
+
+$repeatedNums   = p10FindRepeated($latestBalls, array_slice($rowsMain, 1, 10), $p10Cols);
+$mostActiveSumm = array_slice($topActiveKeys, 0, 3);
+$quietSumm      = array_slice($quietestKeys, 0, 3);
+
+// ── Window comparison ─────────────────────────────────────────────────────────
+$window50  = p10FetchDraws($db, $dbColSafe, $gameId, 50, $p10Cols);
+$window300 = p10FetchDraws($db, $dbColSafe, $gameId, 300, $p10Cols);
+
+[$counts50]  = p10InitRange(1, 80);
+[$counts300] = p10InitRange(1, 80);
+
+foreach ($window50 as $row) {
+    foreach ($p10Cols as $col) {
+        $ball = trim((string) ($row[$col] ?? ''));
+        $ball = p10Pad2($ball);
+        if ($ball !== '' && isset($counts50[$ball])) {
+            $counts50[$ball]++;
+        }
+    }
+}
+
+foreach ($window300 as $row) {
+    foreach ($p10Cols as $col) {
+        $ball = trim((string) ($row[$col] ?? ''));
+        $ball = p10Pad2($ball);
+        if ($ball !== '' && isset($counts300[$ball])) {
+            $counts300[$ball]++;
+        }
+    }
+}
+
+$top50  = p10TopKeys($counts50, 5, false);
+$top300 = p10TopKeys($counts300, 5, false);
+
+$shiftIn  = [];
+$shiftOut = [];
+foreach ($top300 as $n) {
+    if (!in_array($n, $top50, true)) {
+        $shiftIn[] = $n;
+    }
+}
+foreach ($top50 as $n) {
+    if (!in_array($n, $top300, true)) {
+        $shiftOut[] = $n;
+    }
+}
+
+$windowNarrative  = 'In the recent 50-draw view, the leading activity centers on ' . p10CommaList(array_slice($top50, 0, 3)) . '. ';
+$windowNarrative .= 'In the broader 300-draw view, ' . p10CommaList(array_slice($top300, 0, 3)) . ' remains more historically prominent. ';
+if (!empty($shiftIn)) {
+    $windowNarrative .= p10CommaList(array_slice($shiftIn, 0, 2)) . ' gains prominence when the window broadens. ';
+}
+if (!empty($shiftOut)) {
+    $windowNarrative .= p10CommaList(array_slice($shiftOut, 0, 2)) . ' looks more concentrated in the shorter recent view.';
+}
+
+// ── Draw history for current draw ─────────────────────────────────────────────
+$drawHistoryRows = [];
+if ($drawDate !== '') {
+    foreach ($latestBalls as $ball) {
+        $prevDate = p10GetPrevDate($db, $dbColSafe, $gameId, $drawDate, $ball, $p10Cols);
+        $drawsAgo = p10GetDrawsSince($db, $dbColSafe, $gameId, $prevDate, $drawDate);
+        $drawHistoryRows[] = [
+            'label'    => p10Pad2($ball),
+            'prevDate' => $prevDate,
+            'drawsAgo' => $drawsAgo,
+        ];
+    }
+}
+
+// ── CTAs / routes (per game ID) ───────────────────────────────────────────────
+$skaiLink = '/picking-winning-numbers/artificial-intelligence/skai-lottery-prediction?gameId=' . rawurlencode($gameId);
+$hasAiLink = ($gameId !== 'WA4');
+$aiLink    = $hasAiLink
+    ? '/picking-winning-numbers/artificial-intelligence/ai-powered-predictions?game_id=' . rawurlencode($gameId)
+    : '';
+$skipHitLink = ($gameId === 'WA4')
+    ? '/picking-winning-numbers/artificial-intelligence/washington-keno-skip-and-hit-analysis'
+    : '/picking-winning-numbers/artificial-intelligence/skip-and-hit-analysis?game_id=' . rawurlencode($gameId);
+$mcmcLink    = '/picking-winning-numbers/artificial-intelligence/markov-chain-monte-carlo-mcmc-analysis?game_id=' . rawurlencode($gameId);
+$heatmapLink = '/all-lottery-heatmaps?gId=' . rawurlencode($gameId)
+    . '&stateName=' . rawurlencode($stateNameSafe)
+    . '&gName=' . rawurlencode($gNameSafe)
+    . '&sTn=' . rawurlencode(strtolower($stateAbrevSafe));
+$archiveLink = '/lottery-archives?gId=' . rawurlencode($gameId)
+    . '&stateName=' . rawurlencode($stateNameSafe)
+    . '&gName=' . rawurlencode($gNameSafe)
+    . '&sTn=' . rawurlencode(strtolower($stateAbrevSafe));
+$lowestLink  = '/lowest-drawn-number-analysis?gId=' . rawurlencode($gameId)
+    . '&stateName=' . rawurlencode($stateNameSafe)
+    . '&gName=' . rawurlencode($gNameSafe)
+    . '&sTn=' . rawurlencode(strtolower($stateAbrevSafe));
+
+// ── Copy ──────────────────────────────────────────────────────────────────────
+$heroInsight  = 'Latest verified draw and recent number behavior across all 20 drawn positions at a glance. Review the most active numbers, quiet stretches, and full historical frequency before moving into deeper SKAI analysis.';
+$overviewNote = 'Frequency shows historical occurrence within the selected window. With 20 numbers drawn per draw from a pool of 01-80, frequency patterns can highlight concentration and quiet periods, but should be interpreted as context rather than prediction.';
+?>
+<style>
+:root{
+  --skai-blue:#1C66FF;
+  --deep-navy:#0A1A33;
+  --sky-gray:#EFEFF5;
+  --soft-slate:#7F8DAA;
+  --success-green:#20C997;
+  --caution-amber:#F5A623;
+  --white:#FFFFFF;
+  --danger-red:#A61D2D;
+
+  --grad-horizon:linear-gradient(135deg, #0A1A33 0%, #1C66FF 100%);
+  --grad-radiant:linear-gradient(135deg, #1C66FF 0%, #7F8DAA 100%);
+  --grad-slate:linear-gradient(180deg, #EFEFF5 0%, #FFFFFF 100%);
+  --grad-success:linear-gradient(135deg, #20C997 0%, #0A1A33 100%);
+  --grad-ember:linear-gradient(135deg, #F5A623 0%, #0A1A33 100%);
+
+  --text:#0A1A33;
+  --text-soft:#5F6F8C;
+  --line:rgba(10,26,51,.10);
+  --line-strong:rgba(10,26,51,.16);
+  --shadow-1:0 12px 32px rgba(10,26,51,.08);
+  --shadow-2:0 20px 48px rgba(10,26,51,.14);
+  --radius-14:14px;
+  --radius-18:18px;
+  --radius-22:22px;
+  --font:Inter, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+}
+
+*{box-sizing:border-box}
+
+.result-wrapper{display:none !important}
+
+.skai-page{
+  max-width:1180px;
+  margin:0 auto;
+  padding:20px 14px 32px;
+  color:var(--text);
+  font-family:var(--font);
+}
+
+.skai-page a{
+  text-decoration:none;
+}
+
+.skai-grid{
+  display:grid;
+  gap:14px;
+}
+
+.skai-hero{
+  position:relative;
+  overflow:hidden;
+  border-radius:var(--radius-22);
+  background:
+    radial-gradient(900px 420px at -10% -20%, rgba(255,255,255,.13) 0%, rgba(255,255,255,0) 55%),
+    radial-gradient(780px 340px at 110% 0%, rgba(255,255,255,.10) 0%, rgba(255,255,255,0) 55%),
+    var(--grad-horizon);
+  color:#fff;
+  box-shadow:var(--shadow-2);
+  border:1px solid rgba(255,255,255,.10);
+}
+
+.skai-hero-inner{
+  padding:22px 20px 18px;
+}
+
+.skai-hero-top{
+  display:grid;
+  grid-template-columns:110px minmax(0,1fr) 280px;
+  gap:18px;
+  align-items:start;
+}
+
+.skai-logo{
+  width:110px;
+  height:110px;
+  border-radius:20px;
+  background:rgba(255,255,255,.94);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  box-shadow:0 14px 30px rgba(0,0,0,.16);
+  overflow:hidden;
+  padding:12px;
+}
+
+.skai-logo img{
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  display:block;
+}
+
+.skai-hero-copy{
+  min-width:0;
+}
+
+.skai-kicker{
+  font-size:12px;
+  line-height:1.2;
+  letter-spacing:.18em;
+  text-transform:uppercase;
+  font-weight:800;
+  color:rgba(255,255,255,.76);
+  margin:2px 0 8px;
+}
+
+.skai-title{
+  margin:0;
+  font-size:30px;
+  line-height:1.08;
+  font-weight:900;
+  letter-spacing:-.02em;
+  color:#fff;
+}
+
+.skai-hero-summary{
+  margin:12px 0 0;
+  max-width:68ch;
+  font-size:15px;
+  line-height:1.65;
+  color:rgba(255,255,255,.90);
+}
+
+.skai-result-panel{
+  background:rgba(255,255,255,.08);
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:18px;
+  padding:14px;
+  backdrop-filter:blur(4px);
+}
+
+.skai-panel-label{
+  font-size:11px;
+  line-height:1.2;
+  font-weight:800;
+  letter-spacing:.14em;
+  text-transform:uppercase;
+  color:rgba(255,255,255,.72);
+  margin:0 0 10px;
+}
+
+.skai-meta-stack{
+  display:grid;
+  gap:10px;
+}
+
+.skai-meta-row{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+}
+
+.skai-meta-box{
+  background:rgba(255,255,255,.08);
+  border:1px solid rgba(255,255,255,.10);
+  border-radius:14px;
+  padding:10px;
+}
+
+.skai-meta-box span{
+  display:block;
+}
+
+.skai-meta-box .label{
+  font-size:11px;
+  line-height:1.2;
+  font-weight:800;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:rgba(255,255,255,.70);
+}
+
+.skai-meta-box .value{
+  margin-top:6px;
+  font-size:15px;
+  line-height:1.35;
+  font-weight:850;
+  color:#fff;
+}
+
+.skai-ball-row{
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:6px;
+  margin-top:16px;
+}
+
+.skai-ball{
+  width:42px;
+  height:42px;
+  border-radius:999px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  font-size:16px;
+  font-weight:900;
+  letter-spacing:.02em;
+  position:relative;
+}
+
+.skai-ball--main{
+  background:linear-gradient(180deg, #FFFFFF 0%, #F3F6FF 100%);
+  color:var(--deep-navy);
+  border:1px solid rgba(10,26,51,.14);
+  box-shadow:0 10px 20px rgba(10,26,51,.12), inset 0 1px 0 rgba(255,255,255,.90);
+}
+
+.skai-ball--sm{
+  width:34px;
+  height:34px;
+  font-size:13px;
+}
+
+.skai-hero-actions{
+  margin-top:18px;
+  display:grid;
+  grid-template-columns:1.2fr 1fr 1fr;
+  gap:10px;
+}
+
+.skai-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:10px;
+  border-radius:14px;
+  min-height:48px;
+  padding:12px 16px;
+  font-size:14px;
+  line-height:1.2;
+  font-weight:850;
+  transition:transform .14s ease, box-shadow .14s ease, filter .14s ease;
+}
+
+.skai-btn:hover{
+  transform:translateY(-1px);
+}
+
+.skai-btn:focus,
+.skai-btn:focus-visible{
+  outline:3px solid rgba(255,255,255,.30);
+  outline-offset:3px;
+}
+
+.skai-btn--primary{
+  background:#fff;
+  color:var(--deep-navy);
+  box-shadow:0 12px 22px rgba(0,0,0,.14);
+}
+
+.skai-btn--secondary{
+  background:rgba(255,255,255,.12);
+  color:#fff;
+  border:1px solid rgba(255,255,255,.18);
+}
+
+.skai-advanced-links{
+  display:grid;
+  grid-template-columns:repeat(3, minmax(0,1fr));
+  gap:10px;
+  margin-top:10px;
+}
+
+.skai-mini-link{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  min-height:44px;
+  padding:10px 12px;
+  border-radius:12px;
+  background:rgba(255,255,255,.08);
+  border:1px solid rgba(255,255,255,.10);
+  color:#fff;
+  font-size:13px;
+  line-height:1.3;
+  font-weight:800;
+}
+
+.skai-strip{
+  margin-top:14px;
+  display:grid;
+  grid-template-columns:repeat(4, minmax(0,1fr));
+  gap:14px;
+}
+
+.skai-stat{
+  border-radius:18px;
+  overflow:hidden;
+  background:var(--grad-slate);
+  border:1px solid var(--line);
+  box-shadow:var(--shadow-1);
+}
+
+.skai-stat-head{
+  padding:12px 14px;
+  color:#fff;
+  font-size:12px;
+  line-height:1.25;
+  letter-spacing:.12em;
+  text-transform:uppercase;
+  font-weight:850;
+}
+
+.skai-stat-head--horizon{background:var(--grad-horizon)}
+.skai-stat-head--radiant{background:var(--grad-radiant)}
+.skai-stat-head--success{background:var(--grad-success)}
+.skai-stat-head--ember{background:var(--grad-ember)}
+
+.skai-stat-body{
+  padding:14px;
+  min-height:120px;
+  display:flex;
+  flex-direction:column;
+  justify-content:space-between;
+}
+
+.skai-stat-value{
+  font-size:24px;
+  line-height:1.12;
+  font-weight:900;
+  letter-spacing:-.02em;
+  color:var(--deep-navy);
+}
+
+.skai-stat-note{
+  margin-top:10px;
+  font-size:13px;
+  line-height:1.6;
+  color:var(--text-soft);
+}
+
+.skai-tabs{
+  margin-top:18px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  padding:6px;
+  border-radius:999px;
+  background:var(--sky-gray);
+  border:1px solid var(--line);
+}
+
+.skai-tab{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:42px;
+  padding:10px 16px;
+  border-radius:999px;
+  color:var(--deep-navy);
+  font-size:13px;
+  line-height:1.2;
+  font-weight:850;
+}
+
+.skai-tab--active{
+  background:var(--grad-horizon);
+  color:#fff;
+  box-shadow:0 10px 20px rgba(10,26,51,.12);
+}
+
+.skai-section{
+  margin-top:16px;
+  background:var(--grad-slate);
+  border:1px solid var(--line);
+  border-radius:20px;
+  box-shadow:var(--shadow-1);
+  overflow:hidden;
+}
+
+.skai-section-head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:14px;
+  padding:18px 18px 14px;
+  border-bottom:1px solid var(--line);
+  background:rgba(255,255,255,.55);
+}
+
+.skai-section-title{
+  margin:0;
+  font-size:22px;
+  line-height:1.15;
+  letter-spacing:-.02em;
+  font-weight:900;
+  color:var(--deep-navy);
+}
+
+.skai-section-sub{
+  margin:8px 0 0;
+  max-width:76ch;
+  font-size:14px;
+  line-height:1.65;
+  color:var(--text-soft);
+}
+
+.skai-section-body{
+  padding:16px 18px 18px;
+  background:#fff;
+}
+
+.skai-overview-grid{
+  display:grid;
+  grid-template-columns:1.2fr 1fr;
+  gap:14px;
+}
+
+.skai-overview-grid > *{
+  min-width:0;
+}
+
+.skai-card{
+  background:#fff;
+  border:1px solid var(--line);
+  border-radius:18px;
+  box-shadow:0 10px 24px rgba(10,26,51,.06);
+  overflow:hidden;
+}
+
+.skai-card-head{
+  padding:14px 16px;
+  color:#fff;
+  font-weight:850;
+  font-size:16px;
+  line-height:1.25;
+}
+
+.skai-card-head--horizon{background:var(--grad-horizon)}
+.skai-card-head--radiant{background:var(--grad-radiant)}
+.skai-card-head--success{background:var(--grad-success)}
+.skai-card-head--ember{background:var(--grad-ember)}
+
+.skai-card-sub{
+  display:block;
+  margin-top:4px;
+  font-size:12px;
+  line-height:1.45;
+  font-weight:700;
+  opacity:.92;
+}
+
+.skai-card-body{
+  padding:14px 16px 16px;
+}
+
+.skai-chart-shell{
+  position:relative;
+  width:100%;
+}
+
+.skai-chart-frame{
+  position:relative;
+  width:100%;
+  height:300px;
+  overflow:hidden;
+}
+
+.skai-chart-frame--tall{
+  height:820px;
+}
+
+.skai-chart-frame--xtall{
+  height:1600px;
+}
+
+.skai-note{
+  margin-top:14px;
+  padding:14px 16px;
+  border-radius:16px;
+  background:linear-gradient(180deg, #F8FAFE 0%, #FFFFFF 100%);
+  border:1px solid var(--line);
+  color:var(--text-soft);
+  font-size:13px;
+  line-height:1.7;
+}
+
+.skai-two-col{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:14px;
+}
+
+.skai-two-col > *{
+  min-width:0;
+}
+
+.skai-history-list{
+  display:grid;
+  gap:8px;
+}
+
+.skai-window-shift{
+  display:grid;
+  gap:12px;
+}
+
+.skai-shift-panel{
+  border:1px solid var(--line);
+  border-radius:16px;
+  padding:14px 15px;
+  background:linear-gradient(180deg, #FFFFFF 0%, #FAFBFF 100%);
+}
+
+.skai-shift-label{
+  margin:0 0 8px;
+  font-size:12px;
+  line-height:1.2;
+  letter-spacing:.12em;
+  text-transform:uppercase;
+  font-weight:850;
+  color:var(--soft-slate);
+}
+
+.skai-shift-text{
+  margin:0;
+  font-size:14px;
+  line-height:1.7;
+  color:var(--text);
+}
+
+.skai-controls{
+  padding:14px 16px;
+  border-bottom:1px solid var(--line);
+  background:rgba(255,255,255,.76);
+}
+
+.skai-controls form{
+  margin:0;
+}
+
+.skai-controls-row{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+}
+
+.skai-controls-left{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:10px;
+}
+
+.skai-controls-right{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:10px;
+}
+
+.skai-controls label{
+  font-size:13px;
+  line-height:1.2;
+  font-weight:850;
+  color:var(--deep-navy);
+}
+
+.skai-select{
+  min-width:122px;
+  min-height:44px;
+  padding:10px 12px;
+  border-radius:12px;
+  border:1px solid var(--line-strong);
+  background:#fff;
+  color:var(--deep-navy);
+  font-size:14px;
+  line-height:1.2;
+  font-weight:800;
+}
+
+.skai-button{
+  min-height:44px;
+  padding:10px 16px;
+  border:none;
+  border-radius:12px;
+  background:var(--grad-horizon);
+  color:#fff;
+  font-size:13px;
+  line-height:1.2;
+  font-weight:850;
+  cursor:pointer;
+  box-shadow:0 10px 20px rgba(10,26,51,.12);
+}
+
+.skai-button:hover{
+  filter:brightness(1.03);
+}
+
+.skai-filter-group{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+}
+
+.skai-filter{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:36px;
+  padding:8px 12px;
+  border-radius:999px;
+  border:1px solid var(--line);
+  background:#fff;
+  color:var(--deep-navy);
+  font-size:12px;
+  line-height:1.2;
+  font-weight:800;
+  cursor:pointer;
+}
+
+.skai-filter.is-active{
+  background:var(--grad-horizon);
+  border-color:transparent;
+  color:#fff;
+}
+
+.skai-table-wrap{
+  padding:16px;
+  overflow-x:auto;
+}
+
+table.skai-table{
+  width:100%;
+  min-width:320px;
+  border-collapse:separate;
+  border-spacing:0;
+  background:#fff;
+  border:1px solid var(--line);
+  border-radius:16px;
+  overflow:hidden;
+}
+
+table.skai-table thead th{
+  position:sticky;
+  top:0;
+  z-index:1;
+  background:var(--grad-horizon);
+  color:#fff;
+  padding:8px 6px;
+  font-size:11px;
+  line-height:1.2;
+  letter-spacing:.04em;
+  text-transform:uppercase;
+  font-weight:850;
+  text-align:center;
+  border-bottom:1px solid rgba(255,255,255,.12);
+}
+
+table.skai-table tbody td{
+  padding:9px 7px;
+  text-align:center;
+  border-bottom:1px solid rgba(10,26,51,.06);
+  font-size:14px;
+  line-height:1.45;
+  color:var(--deep-navy);
+  vertical-align:middle;
+}
+
+table.skai-table tbody tr:hover{
+  background:rgba(28,102,255,.04);
+}
+
+.skai-pill{
+  width:34px;
+  height:34px;
+  border-radius:999px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  font-size:14px;
+  line-height:1;
+  font-weight:900;
+}
+
+.skai-pill--main{
+  background:linear-gradient(180deg, #FFFFFF 0%, #F3F6FF 100%);
+  color:var(--deep-navy);
+  border:1px solid rgba(10,26,51,.14);
+  box-shadow:0 8px 16px rgba(10,26,51,.08);
+}
+
+.skai-checkbox{
+  transform:scale(1.25);
+  cursor:pointer;
+}
+
+.skai-tracked{
+  margin-top:14px;
+  border:1px solid var(--line);
+  border-radius:16px;
+  background:var(--grad-slate);
+  overflow:hidden;
+}
+
+.skai-tracked-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:12px 14px;
+  border-bottom:1px solid var(--line);
+}
+
+.skai-tracked-title{
+  margin:0;
+  font-size:15px;
+  line-height:1.2;
+  font-weight:850;
+  color:var(--deep-navy);
+}
+
+.skai-tracked-actions{
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+
+.skai-link-btn{
+  border:none;
+  background:none;
+  color:var(--skai-blue);
+  font-size:12px;
+  line-height:1.2;
+  font-weight:850;
+  cursor:pointer;
+  padding:0;
+}
+
+.skai-chip-wrap{
+  padding:12px 14px 14px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  min-height:64px;
+  align-items:flex-start;
+}
+
+.skai-empty{
+  font-size:13px;
+  line-height:1.6;
+  color:var(--text-soft);
+}
+
+.skai-chip{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:36px;
+  padding:8px 12px;
+  border-radius:999px;
+  font-size:13px;
+  line-height:1.2;
+  font-weight:850;
+}
+
+.skai-chip--main{
+  background:linear-gradient(180deg, #FFFFFF 0%, #F3F6FF 100%);
+  border:1px solid rgba(10,26,51,.14);
+  color:var(--deep-navy);
+}
+
+.skai-tool-grid{
+  display:grid;
+  grid-template-columns:1.2fr 1fr 1fr;
+  gap:14px;
+}
+
+.skai-tool{
+  border-radius:18px;
+  overflow:hidden;
+  border:1px solid var(--line);
+  background:#fff;
+  box-shadow:0 10px 24px rgba(10,26,51,.06);
+}
+
+.skai-tool-head{
+  padding:14px 16px;
+  color:#fff;
+  font-size:15px;
+  line-height:1.3;
+  font-weight:850;
+}
+
+.skai-tool-body{
+  padding:15px 16px 16px;
+}
+
+.skai-tool-copy{
+  margin:0 0 14px;
+  font-size:14px;
+  line-height:1.7;
+  color:var(--text-soft);
+}
+
+.skai-tool-cta{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:44px;
+  padding:10px 16px;
+  border-radius:12px;
+  font-size:13px;
+  line-height:1.2;
+  font-weight:850;
+  background:var(--grad-horizon);
+  color:#fff;
+}
+
+.skai-utility-grid{
+  display:grid;
+  grid-template-columns:repeat(4, minmax(0,1fr));
+  gap:10px;
+  margin-top:12px;
+}
+
+.skai-utility-link{
+  min-height:42px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  padding:10px 12px;
+  border-radius:12px;
+  border:1px solid var(--line);
+  background:var(--grad-slate);
+  color:var(--deep-navy);
+  font-size:13px;
+  line-height:1.3;
+  font-weight:850;
+}
+
+.skai-method-note{
+  padding:16px;
+  border-radius:16px;
+  border:1px solid var(--line);
+  background:linear-gradient(180deg, #FAFBFF 0%, #FFFFFF 100%);
+  font-size:14px;
+  line-height:1.8;
+  color:var(--text-soft);
+}
+
+.skai-method-note strong{
+  color:var(--deep-navy);
+}
+
+@media (max-width:1080px){
+  .skai-hero-top{
+    grid-template-columns:96px minmax(0,1fr);
+  }
+  .skai-result-panel{
+    grid-column:1 / -1;
+  }
+  .skai-strip,
+  .skai-tool-grid,
+  .skai-overview-grid,
+  .skai-two-col{
+    grid-template-columns:1fr;
+  }
+  .skai-hero-actions,
+  .skai-advanced-links{
+    grid-template-columns:1fr;
+  }
+  .skai-utility-grid{
+    grid-template-columns:repeat(2, minmax(0,1fr));
+  }
+}
+
+@media (max-width:780px){
+  .skai-page{
+    padding:14px 10px 24px;
+  }
+  .skai-title{
+    font-size:26px;
+  }
+  .skai-section-head{
+    padding:16px 14px 12px;
+  }
+  .skai-section-body{
+    padding:14px;
+  }
+  .skai-strip{
+    grid-template-columns:1fr 1fr;
+  }
+  .skai-meta-row{
+    grid-template-columns:1fr;
+  }
+  .skai-tabs{
+    border-radius:18px;
+  }
+  .skai-utility-grid{
+    grid-template-columns:1fr 1fr;
+  }
+}
+
+@media (max-width:480px){
+  .skai-strip{
+    grid-template-columns:1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce){
+  .skai-btn,
+  .skai-button{
+    transition:none;
+  }
+}
+</style>
+
+<div class="skai-page">
+
+  <section class="skai-hero" aria-label="Results intelligence header">
+    <div class="skai-hero-inner">
+      <div class="skai-hero-top">
+
+        <div class="skai-logo" aria-hidden="<?php echo $logo['exists'] ? 'false' : 'true'; ?>">
+          <?php if ($logo['exists'] && $logo['url'] !== '') : ?>
+            <img
+              src="<?php echo htmlspecialchars($logo['url'], ENT_QUOTES, 'UTF-8'); ?>"
+              alt="<?php echo htmlspecialchars($stateNameSafe . ' ' . $gNameSafe, ENT_QUOTES, 'UTF-8'); ?>"
+              width="110"
+              height="110"
+              loading="lazy"
+              decoding="async"
+            >
+          <?php else : ?>
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 2l2.7 6.2L21 9l-4.7 4.1L17.6 21 12 17.8 6.4 21l1.3-7.9L3 9l6.3-.8L12 2z" stroke="rgba(10,26,51,.55)" stroke-width="1.6" stroke-linejoin="round"/>
+            </svg>
+          <?php endif; ?>
+        </div>
+
+        <div class="skai-hero-copy">
+          <div class="skai-kicker">Results Intelligence &bull; Pick 10 / 80 &bull; Verified Draw &bull; Analytical View</div>
+          <h1 class="skai-title">
+            <?php echo htmlspecialchars($stateNameSafe, ENT_QUOTES, 'UTF-8'); ?>
+            &ndash;
+            <?php echo htmlspecialchars($gNameSafe, ENT_QUOTES, 'UTF-8'); ?>
+          </h1>
+          <p class="skai-hero-summary"><?php echo htmlspecialchars($heroInsight, ENT_QUOTES, 'UTF-8'); ?></p>
+
+          <div class="skai-ball-row" aria-label="Latest 20 drawn numbers">
+            <?php foreach ($latestBalls as $ball) : ?>
+              <span class="skai-ball skai-ball--main skai-ball--sm"><?php echo htmlspecialchars(p10Pad2($ball), ENT_QUOTES, 'UTF-8'); ?></span>
+            <?php endforeach; ?>
+          </div>
+
+          <div class="skai-hero-actions" aria-label="Primary actions">
+            <a class="skai-btn skai-btn--primary" href="<?php echo htmlspecialchars($skaiLink, ENT_QUOTES, 'UTF-8'); ?>">
+              Open SKAI Analysis
+            </a>
+            <?php if ($hasAiLink) : ?>
+              <a class="skai-btn skai-btn--secondary" href="<?php echo htmlspecialchars($aiLink, ENT_QUOTES, 'UTF-8'); ?>">
+                AI Predictions
+              </a>
+            <?php else : ?>
+              <a class="skai-btn skai-btn--secondary" href="<?php echo htmlspecialchars($skipHitLink, ENT_QUOTES, 'UTF-8'); ?>">
+                Skip &amp; Hit Analysis
+              </a>
+            <?php endif; ?>
+            <a class="skai-btn skai-btn--secondary" href="#frequency-deep-dive">
+              View Frequency Deep Dive
+            </a>
+          </div>
+
+          <div class="skai-advanced-links" aria-label="Advanced tools">
+            <a class="skai-mini-link" href="<?php echo htmlspecialchars($skipHitLink, ENT_QUOTES, 'UTF-8'); ?>">Skip &amp; Hit Analysis</a>
+            <a class="skai-mini-link" href="<?php echo htmlspecialchars($mcmcLink, ENT_QUOTES, 'UTF-8'); ?>">MCMC Markov Analysis</a>
+            <a class="skai-mini-link" href="<?php echo htmlspecialchars($heatmapLink, ENT_QUOTES, 'UTF-8'); ?>">Heatmap Analysis</a>
+          </div>
+        </div>
+
+        <aside class="skai-result-panel" aria-label="Latest draw details">
+          <div class="skai-panel-label">Latest draw summary</div>
+          <div class="skai-meta-stack">
+            <div class="skai-meta-row">
+              <div class="skai-meta-box">
+                <span class="label">Draw date</span>
+                <span class="value"><?php echo htmlspecialchars(p10FmtDateLong($drawDate), ENT_QUOTES, 'UTF-8'); ?></span>
+              </div>
+              <div class="skai-meta-box">
+                <span class="label">Next draw date</span>
+                <span class="value"><?php echo htmlspecialchars(p10FmtDateLong($nextDrawDate), ENT_QUOTES, 'UTF-8'); ?></span>
+              </div>
+            </div>
+            <div class="skai-meta-box">
+              <span class="label">Format</span>
+              <span class="value">Pick 10 &mdash; 20 numbers drawn from pool 01&ndash;80</span>
+            </div>
+            <?php if ($nextJackpot !== '' && $nextJackpot !== '0' && $nextJackpot !== 'n/a') : ?>
+              <div class="skai-meta-box">
+                <span class="label">Next jackpot</span>
+                <span class="value">$<?php echo htmlspecialchars(number_format((float) $nextJackpot, 0, '.', ','), ENT_QUOTES, 'UTF-8'); ?></span>
+              </div>
+            <?php endif; ?>
+          </div>
+        </aside>
+
+      </div>
+    </div>
+  </section>
+
+  <section class="skai-strip" aria-label="Key takeaways">
+    <article class="skai-stat">
+      <div class="skai-stat-head skai-stat-head--horizon">Most active</div>
+      <div class="skai-stat-body">
+        <div class="skai-stat-value"><?php echo htmlspecialchars(p10CommaList($mostActiveSumm), ENT_QUOTES, 'UTF-8'); ?></div>
+        <div class="skai-stat-note">Highest appearance counts in the current <?php echo (int) $nodCurrent; ?>-draw window.</div>
+      </div>
+    </article>
+
+    <article class="skai-stat">
+      <div class="skai-stat-head skai-stat-head--radiant">Quietest now</div>
+      <div class="skai-stat-body">
+        <div class="skai-stat-value"><?php echo htmlspecialchars(p10CommaList($quietSumm), ENT_QUOTES, 'UTF-8'); ?></div>
+        <div class="skai-stat-note">Numbers sitting furthest from their most recent appearance in the selected window.</div>
+      </div>
+    </article>
+
+    <article class="skai-stat">
+      <div class="skai-stat-head skai-stat-head--success">Repeated recently</div>
+      <div class="skai-stat-body">
+        <div class="skai-stat-value"><?php echo htmlspecialchars(!empty($repeatedNums) ? p10CommaList($repeatedNums) : 'None', ENT_QUOTES, 'UTF-8'); ?></div>
+        <div class="skai-stat-note">Numbers from the latest draw that also appeared in one of the 10 preceding draws.</div>
+      </div>
+    </article>
+
+    <article class="skai-stat">
+      <div class="skai-stat-head skai-stat-head--ember">Window analyzed</div>
+      <div class="skai-stat-body">
+        <div class="skai-stat-value"><?php echo (int) $nodCurrent; ?></div>
+        <div class="skai-stat-note">Draw window currently loaded for this page view. Adjust in the Tables section.</div>
+      </div>
+    </article>
+  </section>
+
+  <nav class="skai-tabs" aria-label="Page navigation">
+    <a class="skai-tab skai-tab--active" href="#overview">Overview</a>
+    <a class="skai-tab" href="#frequency-deep-dive">Frequency</a>
+    <a class="skai-tab" href="#recency-deep-dive">Recency</a>
+    <a class="skai-tab" href="#tables">Tables</a>
+    <a class="skai-tab" href="#tools">Advanced Tools</a>
+  </nav>
+
+  <section id="overview" class="skai-section" aria-labelledby="overview-title">
+    <div class="skai-section-head">
+      <div>
+        <h2 id="overview-title" class="skai-section-title">Overview</h2>
+        <p class="skai-section-sub">
+          Start with a clear high-level view. This layer is designed for fast orientation: which numbers are most active in the selected window, which are quiet, and how the current draw compares to recent history.
+        </p>
+      </div>
+    </div>
+
+    <div class="skai-section-body">
+      <div class="skai-overview-grid">
+        <div class="skai-card">
+          <div class="skai-card-head skai-card-head--horizon">
+            Top active numbers
+            <span class="skai-card-sub">Highest frequency counts in the last <?php echo (int) $nodCurrent; ?> drawings</span>
+          </div>
+          <div class="skai-card-body">
+            <div class="skai-chart-shell">
+              <div class="skai-chart-frame">
+                <canvas id="topActiveChart" aria-label="Top active numbers chart" role="img"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="skai-card">
+          <div class="skai-card-head skai-card-head--ember">
+            Quiet stretches
+            <span class="skai-card-sub">Numbers with the longest distance from their last appearance</span>
+          </div>
+          <div class="skai-card-body">
+            <div class="skai-chart-shell">
+              <div class="skai-chart-frame">
+                <canvas id="quietChart" aria-label="Quiet numbers chart" role="img"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="skai-note">
+        <?php echo htmlspecialchars($overviewNote, ENT_QUOTES, 'UTF-8'); ?>
+      </div>
+    </div>
+  </section>
+
+  <section id="recency-deep-dive" class="skai-section" aria-labelledby="recency-title">
+    <div class="skai-section-head">
+      <div>
+        <h2 id="recency-title" class="skai-section-title">Recency and draw context</h2>
+        <p class="skai-section-sub">
+          This section makes the current draw easier to interpret. It shows how recently each drawn number was previously seen and how the perspective shifts when comparing a short recent window to a broader historical one. Recency means how many draws have passed since a number last appeared.
+        </p>
+      </div>
+    </div>
+
+    <div class="skai-section-body">
+      <div class="skai-two-col">
+        <div class="skai-card">
+          <div class="skai-card-head skai-card-head--radiant">
+            Current draw history
+            <span class="skai-card-sub">Previous appearance date and spacing for each of the 20 drawn values</span>
+          </div>
+          <div class="skai-card-body">
+            <div class="skai-table-wrap" style="padding:0">
+              <table class="skai-table" aria-label="Current draw ball history">
+                <thead>
+                  <tr>
+                    <th>Ball</th>
+                    <th>Previous Appearance</th>
+                    <th>Spacing</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php foreach ($drawHistoryRows as $row) : ?>
+                    <tr>
+                      <td><span class="skai-pill skai-pill--main"><?php echo htmlspecialchars((string) $row['label'], ENT_QUOTES, 'UTF-8'); ?></span></td>
+                      <td style="text-align:left;font-size:13px">
+                        <?php if (!empty($row['prevDate'])) : ?>
+                          <?php echo htmlspecialchars(p10FmtDateLong((string) $row['prevDate']), ENT_QUOTES, 'UTF-8'); ?>
+                        <?php else : ?>
+                          No prior appearance found in loaded set
+                        <?php endif; ?>
+                      </td>
+                      <td style="white-space:nowrap">
+                        <?php echo ($row['drawsAgo'] !== null) ? (int) $row['drawsAgo'] . ' drws ago' : '&mdash;'; ?>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="skai-card">
+          <div class="skai-card-head skai-card-head--success">
+            What changes with the window
+            <span class="skai-card-sub">Comparing shorter recent behavior with broader historical behavior</span>
+          </div>
+          <div class="skai-card-body">
+            <div class="skai-window-shift">
+              <div class="skai-shift-panel">
+                <p class="skai-shift-label">Window shift note</p>
+                <p class="skai-shift-text"><?php echo htmlspecialchars($windowNarrative, ENT_QUOTES, 'UTF-8'); ?></p>
+              </div>
+              <div class="skai-shift-panel">
+                <p class="skai-shift-label">Recent 50-draw leaders</p>
+                <p class="skai-shift-text"><?php echo htmlspecialchars(p10CommaList(array_slice($top50, 0, 5)), ENT_QUOTES, 'UTF-8'); ?></p>
+              </div>
+              <div class="skai-shift-panel">
+                <p class="skai-shift-label">Broader 300-draw leaders</p>
+                <p class="skai-shift-text"><?php echo htmlspecialchars(p10CommaList(array_slice($top300, 0, 5)), ENT_QUOTES, 'UTF-8'); ?></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="frequency-deep-dive" class="skai-section" aria-labelledby="frequency-title">
+    <div class="skai-section-head">
+      <div>
+        <h2 id="frequency-title" class="skai-section-title">Frequency deep dive</h2>
+        <p class="skai-section-sub">
+          Move from summary to full reference. The first panel shows the complete number distribution across all values 01&ndash;80. The second panel shows the recency distance (draws since last appearance) for every number, allowing side-by-side comparison of frequency and spacing behavior.
+        </p>
+      </div>
+    </div>
+
+    <div class="skai-section-body">
+      <div class="skai-two-col">
+        <div class="skai-card">
+          <div class="skai-card-head skai-card-head--horizon">
+            Full number distribution
+            <span class="skai-card-sub">All values 01&ndash;80 across the last <?php echo (int) $nodCurrent; ?> drawings</span>
+          </div>
+          <div class="skai-card-body">
+            <div class="skai-chart-shell">
+              <div class="skai-chart-frame skai-chart-frame--xtall">
+                <canvas id="fullMainChart" aria-label="Full number distribution chart" role="img"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="skai-grid">
+          <div class="skai-card">
+            <div class="skai-card-head skai-card-head--ember">
+              Recency distribution
+              <span class="skai-card-sub">Draws since last appearance for each number in the pool</span>
+            </div>
+            <div class="skai-card-body">
+              <div class="skai-chart-shell">
+                <div class="skai-chart-frame skai-chart-frame--tall">
+                  <canvas id="recencyChart" aria-label="Recency distribution chart" role="img"></canvas>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="skai-note">
+        The complete distribution is best used as a reference layer. The overview modules above are optimized for quick reading; this section is optimized for thorough review. Numbers with higher recency values have gone more draws without appearing in the most recent window.
+      </div>
+    </div>
+  </section>
+
+  <section id="tables" class="skai-section" aria-labelledby="tables-title">
+    <div class="skai-section-head">
+      <div>
+        <h2 id="tables-title" class="skai-section-title">Tables and tracked numbers</h2>
+        <p class="skai-section-sub">
+          Use the table for exact counts, recency, and personal tracking. Quick filters help narrow the view without losing full access to the complete dataset. Frequency is the count of draws — within the selected window — where that number appeared among the 20 drawn values.
+        </p>
+      </div>
+    </div>
+
+    <div class="skai-controls">
+      <form name="fqsearch" method="post" action="/all-us-lotteries/results-analysis?st=<?php echo htmlspecialchars($stateAbrevSafe, ENT_QUOTES, 'UTF-8'); ?>&amp;stn=<?php echo htmlspecialchars($stateNameSafe, ENT_QUOTES, 'UTF-8'); ?>&amp;gm=<?php echo htmlspecialchars($gNameSafe, ENT_QUOTES, 'UTF-8'); ?>#tables">
+        <div class="skai-controls-row">
+          <div class="skai-controls-left">
+            <label for="nod">Draw window</label>
+            <select name="nod" id="nod" class="skai-select">
+              <?php foreach (range(10, 700, 5) as $opt) : ?>
+                <option value="<?php echo (int) $opt; ?>"<?php echo ((int) $opt === (int) $nodCurrent) ? ' selected="selected"' : ''; ?>>
+                  <?php echo (int) $opt; ?>
+                </option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="skai-controls-right">
+            <button class="skai-button" name="fq-search" type="submit" value="1">Update analysis window</button>
+            <?php echo HTMLHelper::_('form.token'); ?>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <div class="skai-section-body">
+      <div class="skai-card">
+        <div class="skai-card-head skai-card-head--horizon">
+          Numbers 01&ndash;80 frequency table
+          <span class="skai-card-sub">Exact counts and recency for the full pool — last <?php echo (int) $nodCurrent; ?> drawings</span>
+        </div>
+
+        <div class="skai-controls">
+          <div class="skai-controls-row">
+            <div class="skai-controls-left">
+              <div class="skai-filter-group" data-filter-group="main">
+                <button class="skai-filter is-active" type="button" data-filter="all">All</button>
+                <button class="skai-filter" type="button" data-filter="active">Most active</button>
+                <button class="skai-filter" type="button" data-filter="quiet">Quietest</button>
+                <button class="skai-filter" type="button" data-filter="recent">Recently seen</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="skai-table-wrap">
+          <table id="skai-main-table" class="skai-table" aria-label="Main numbers frequency table">
+            <thead>
+              <tr>
+                <th>Number</th>
+                <th>Drawn Times</th>
+                <th>Last Drawn</th>
+                <th>Track</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php for ($i = 1; $i <= 80; $i++) : ?>
+                <?php
+                $number      = ($i < 10) ? '0' . $i : (string) $i;
+                $countNumber = (int) ($mainCounts[$number] ?? 0);
+                [$lastDrawSort, $lastDrawLabel] = p10DrawingsAgoLabel($mainLastIdx[$number] ?? null, (int) $nodCurrent);
+
+                $rowClass = 'all';
+                if (in_array($number, $topActiveKeys, true)) {
+                    $rowClass .= ' active';
+                }
+                if (in_array($number, $quietestKeys, true)) {
+                    $rowClass .= ' quiet';
+                }
+                if (($mainLastIdx[$number] ?? null) !== null && (int) $mainLastIdx[$number] <= 4) {
+                    $rowClass .= ' recent';
+                }
+                ?>
+                <tr data-tags="<?php echo htmlspecialchars($rowClass, ENT_QUOTES, 'UTF-8'); ?>">
+                  <td><span class="skai-pill skai-pill--main"><?php echo htmlspecialchars($number, ENT_QUOTES, 'UTF-8'); ?></span></td>
+                  <td><?php echo (int) $countNumber; ?> X</td>
+                  <td data-sort="<?php echo (int) $lastDrawSort; ?>"><?php echo htmlspecialchars($lastDrawLabel, ENT_QUOTES, 'UTF-8'); ?></td>
+                  <td>
+                    <input
+                      class="skai-checkbox js-track-main"
+                      type="checkbox"
+                      value="<?php echo htmlspecialchars($number, ENT_QUOTES, 'UTF-8'); ?>"
+                      aria-label="Track number <?php echo htmlspecialchars($number, ENT_QUOTES, 'UTF-8'); ?>"
+                    >
+                  </td>
+                </tr>
+              <?php endfor; ?>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="skai-tracked">
+          <div class="skai-tracked-head">
+            <h3 class="skai-tracked-title">Tracked numbers</h3>
+            <div class="skai-tracked-actions">
+              <button class="skai-link-btn" type="button" id="clearMainTracked">Clear all</button>
+            </div>
+          </div>
+          <div class="skai-chip-wrap" id="mainTrackedWrap">
+            <div class="skai-empty">Select numbers to create a tracked set for comparison across this page.</div>
+          </div>
+        </div>
+
+        <div class="skai-note">
+          Tracking is local to this page view. It is intended as a lightweight comparison aid while you move between the overview, tables, and advanced SKAI tools.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tools" class="skai-section" aria-labelledby="tools-title">
+    <div class="skai-section-head">
+      <div>
+        <h2 id="tools-title" class="skai-section-title">Next steps and advanced tools</h2>
+        <p class="skai-section-sub">
+          The results page establishes context. These tools take that context into deeper modeling and structured exploration.
+        </p>
+      </div>
+    </div>
+
+    <div class="skai-section-body">
+      <div class="skai-tool-grid">
+        <article class="skai-tool">
+          <div class="skai-tool-head skai-card-head--horizon">SKAI Analysis</div>
+          <div class="skai-tool-body">
+            <p class="skai-tool-copy">
+              Best next step for a broader multi-signal view. Use this after reviewing frequency and recency to move into the main SKAI intelligence workflow.
+            </p>
+            <a class="skai-tool-cta" href="<?php echo htmlspecialchars($skaiLink, ENT_QUOTES, 'UTF-8'); ?>">Open SKAI Analysis</a>
+          </div>
+        </article>
+
+        <?php if ($hasAiLink) : ?>
+          <article class="skai-tool">
+            <div class="skai-tool-head skai-card-head--radiant">AI Predictions</div>
+            <div class="skai-tool-body">
+              <p class="skai-tool-copy">
+                Use when you want a model-driven complement to the historical view shown on this page.
+              </p>
+              <a class="skai-tool-cta" href="<?php echo htmlspecialchars($aiLink, ENT_QUOTES, 'UTF-8'); ?>">Open AI Predictions</a>
+            </div>
+          </article>
+        <?php else : ?>
+          <article class="skai-tool">
+            <div class="skai-tool-head skai-card-head--radiant">MCMC Markov Analysis</div>
+            <div class="skai-tool-body">
+              <p class="skai-tool-copy">
+                Explore transition patterns across draw sequences. Useful for examining structural tendencies across the broader history of this game.
+              </p>
+              <a class="skai-tool-cta" href="<?php echo htmlspecialchars($mcmcLink, ENT_QUOTES, 'UTF-8'); ?>">Open MCMC Analysis</a>
+            </div>
+          </article>
+        <?php endif; ?>
+
+        <article class="skai-tool">
+          <div class="skai-tool-head skai-card-head--success">Skip &amp; Hit Analysis</div>
+          <div class="skai-tool-body">
+            <p class="skai-tool-copy">
+              Useful for comparing appearance spacing and interruption behavior after reviewing current frequency patterns.
+            </p>
+            <a class="skai-tool-cta" href="<?php echo htmlspecialchars($skipHitLink, ENT_QUOTES, 'UTF-8'); ?>">Open Skip &amp; Hit</a>
+          </div>
+        </article>
+      </div>
+
+      <div class="skai-utility-grid">
+        <a class="skai-utility-link" href="<?php echo htmlspecialchars($mcmcLink, ENT_QUOTES, 'UTF-8'); ?>">MCMC Markov Analysis</a>
+        <a class="skai-utility-link" href="<?php echo htmlspecialchars($heatmapLink, ENT_QUOTES, 'UTF-8'); ?>">Heatmap Analysis</a>
+        <a class="skai-utility-link" href="<?php echo htmlspecialchars($archiveLink, ENT_QUOTES, 'UTF-8'); ?>">Lottery Archives</a>
+        <a class="skai-utility-link" href="<?php echo htmlspecialchars($lowestLink, ENT_QUOTES, 'UTF-8'); ?>">Lowest Number Analysis</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="skai-section" aria-labelledby="method-title">
+    <div class="skai-section-head">
+      <div>
+        <h2 id="method-title" class="skai-section-title">Method note</h2>
+        <p class="skai-section-sub">
+          This page is designed to help users understand recent and historical behavior more clearly, not to imply certainty or guide gambling decisions.
+        </p>
+      </div>
+    </div>
+    <div class="skai-section-body">
+      <div class="skai-method-note">
+        <strong>Interpretation guidance:</strong> Frequency shows how often each number appeared among the 20 drawn values within the selected draw window. Recency shows how many draws have passed since a number was last drawn. Both are descriptive signals about historical behavior. They do not predict future draws. Lottery draws are independent events and past patterns do not alter future probabilities. Use these tools as structured context, not as a basis for financial decisions.
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<script type="application/ld+json">
+<?php
+$jsonLd = [
+    '@context'    => 'https://schema.org',
+    '@type'       => 'WebPage',
+    'name'        => ($stateNameSafe !== '' && $gNameSafe !== '') ? $stateNameSafe . ' ' . $gNameSafe . ' Results Intelligence' : 'Pick 10/80 Results Intelligence',
+    'description' => 'Frequency, recency, and activity analysis for ' . $stateNameSafe . ' ' . $gNameSafe . ' lottery draws. Pick 10/80 format — 20 numbers drawn from a pool of 01–80.',
+    'url'         => $canonicalNoQuery,
+    'provider'    => [
+        '@type' => 'Organization',
+        'name'  => 'LottoExpert.net',
+        'url'   => 'https://lottoexpert.net',
+    ],
+];
+echo json_encode($jsonLd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+?>
+</script>
+
+<script type="text/javascript">
+(function () {
+  'use strict';
+
+  var chartData = {
+    topActiveLabels:  <?php echo json_encode(array_values($topActiveLabels)); ?>,
+    topActiveValues:  <?php echo json_encode(array_values($topActiveValues)); ?>,
+    quietLabels:      <?php echo json_encode(array_values($quietestLabels)); ?>,
+    quietValues:      <?php echo json_encode(array_values($quietestValues)); ?>,
+    mainLabels:       <?php echo json_encode(array_values($mainLabels)); ?>,
+    mainValues:       <?php echo json_encode(array_values($mainChartValues)); ?>,
+    mainRecencyValues:<?php echo json_encode(array_values($mainRecencyValues)); ?>
+  };
+
+  function loadChartJsIfNeeded(done) {
+    if (window.Chart) {
+      done();
+      return;
+    }
+
+    var cdnUrl   = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+    var integrity = 'sha384-OLBgp1GsljhM2TJ+sbHjaiH9txEUvgdDTAzHv2P24donTt6/529l+9Ua0vFImLlb';
+
+    function tryLoad(withIntegrity) {
+      var script       = document.createElement('script');
+      script.src       = cdnUrl;
+      script.async     = true;
+      if (withIntegrity) {
+        script.integrity    = integrity;
+        script.crossOrigin  = 'anonymous';
+      }
+      script.onload = function () { done(); };
+      script.onerror = function () {
+        if (withIntegrity) {
+          tryLoad(false);
+        } else {
+          done();
+        }
+      };
+      document.head.appendChild(script);
+    }
+
+    tryLoad(true);
+  }
+
+  function commonBarOptions(horizontal) {
+    return {
+      responsive:          true,
+      maintainAspectRatio: false,
+      indexAxis:           horizontal ? 'y' : 'x',
+      animation:           false,
+      plugins: {
+        legend:  { display: false },
+        tooltip: { enabled: true }
+      },
+      scales: horizontal ? {
+        x: {
+          beginAtZero: true,
+          ticks: { precision: 0, font: { weight: '700' } },
+          grid:  { color: 'rgba(10,26,51,.08)' }
+        },
+        y: {
+          ticks: { autoSkip: false, font: { weight: '700' } },
+          grid:  { display: false }
+        }
+      } : {
+        x: {
+          ticks: { font: { weight: '700' } },
+          grid:  { display: false }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: { precision: 0, font: { weight: '700' } },
+          grid:  { color: 'rgba(10,26,51,.08)' }
+        }
+      }
+    };
+  }
+
+  var chartsRendered = false;
+
+  function renderCharts() {
+    if (!window.Chart || chartsRendered) {
+      return;
+    }
+    chartsRendered = true;
+
+    var topActiveCanvas = document.getElementById('topActiveChart');
+    var quietCanvas     = document.getElementById('quietChart');
+    var fullMainCanvas  = document.getElementById('fullMainChart');
+    var recencyCanvas   = document.getElementById('recencyChart');
+
+    if (topActiveCanvas) {
+      new Chart(topActiveCanvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels:   chartData.topActiveLabels,
+          datasets: [{
+            data:            chartData.topActiveValues,
+            borderWidth:     0,
+            borderRadius:    8,
+            backgroundColor: '#1C66FF'
+          }]
+        },
+        options: commonBarOptions(false)
+      });
+    }
+
+    if (quietCanvas) {
+      new Chart(quietCanvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels:   chartData.quietLabels,
+          datasets: [{
+            data:            chartData.quietValues,
+            borderWidth:     0,
+            borderRadius:    8,
+            backgroundColor: '#F5A623'
+          }]
+        },
+        options: commonBarOptions(false)
+      });
+    }
+
+    if (fullMainCanvas) {
+      new Chart(fullMainCanvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels:   chartData.mainLabels,
+          datasets: [{
+            data:            chartData.mainValues,
+            borderWidth:     0,
+            borderRadius:    4,
+            barThickness:    14,
+            maxBarThickness: 16,
+            backgroundColor: '#1C66FF'
+          }]
+        },
+        options: commonBarOptions(true)
+      });
+    }
+
+    if (recencyCanvas) {
+      new Chart(recencyCanvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels:   chartData.mainLabels,
+          datasets: [{
+            data:            chartData.mainRecencyValues,
+            borderWidth:     0,
+            borderRadius:    4,
+            barThickness:    14,
+            maxBarThickness: 16,
+            backgroundColor: '#F5A623'
+          }]
+        },
+        options: {
+          responsive:          true,
+          maintainAspectRatio: false,
+          indexAxis:           'y',
+          animation:           false,
+          plugins: {
+            legend:  { display: false },
+            tooltip: { enabled: true }
+          },
+          scales: {
+            x: {
+              beginAtZero: true,
+              ticks: { precision: 0, font: { weight: '700' } },
+              grid:  { color: 'rgba(10,26,51,.08)' }
+            },
+            y: {
+              ticks: { autoSkip: false, font: { weight: '700' } },
+              grid:  { display: false }
+            }
+          }
+        }
+      });
+    }
+  }
+
+  function bindTrackers() {
+    var mainWrap   = document.getElementById('mainTrackedWrap');
+    var clearMain  = document.getElementById('clearMainTracked');
+
+    if (!mainWrap) {
+      return;
+    }
+
+    function renderTracked(selector, wrap, chipClass, emptyText) {
+      var inputs = document.querySelectorAll(selector);
+      var items  = [];
+      var i;
+
+      for (i = 0; i < inputs.length; i++) {
+        if (inputs[i].checked) {
+          items.push(inputs[i].value);
+        }
+      }
+
+      wrap.innerHTML = '';
+
+      if (!items.length) {
+        var empty       = document.createElement('div');
+        empty.className = 'skai-empty';
+        empty.textContent = emptyText;
+        wrap.appendChild(empty);
+        return;
+      }
+
+      for (var j = 0; j < items.length; j++) {
+        var chip       = document.createElement('span');
+        chip.className = 'skai-chip ' + chipClass;
+        chip.textContent = items[j];
+        wrap.appendChild(chip);
+      }
+    }
+
+    function bindGroup(selector, wrap, chipClass, emptyText) {
+      var inputs = document.querySelectorAll(selector);
+      var i;
+      for (i = 0; i < inputs.length; i++) {
+        inputs[i].addEventListener('change', function () {
+          renderTracked(selector, wrap, chipClass, emptyText);
+        });
+      }
+      renderTracked(selector, wrap, chipClass, emptyText);
+    }
+
+    bindGroup(
+      '.js-track-main',
+      mainWrap,
+      'skai-chip--main',
+      'Select numbers to create a tracked set for comparison across this page.'
+    );
+
+    if (clearMain) {
+      clearMain.addEventListener('click', function () {
+        var inputs = document.querySelectorAll('.js-track-main');
+        var i;
+        for (i = 0; i < inputs.length; i++) {
+          inputs[i].checked = false;
+        }
+        renderTracked(
+          '.js-track-main',
+          mainWrap,
+          'skai-chip--main',
+          'Select numbers to create a tracked set for comparison across this page.'
+        );
+      });
+    }
+  }
+
+  function bindFilters() {
+    var group = document.querySelector('[data-filter-group="main"]');
+    var table = document.getElementById('skai-main-table');
+
+    if (!group || !table) {
+      return;
+    }
+
+    var buttons = group.querySelectorAll('.skai-filter');
+    var rows    = table.querySelectorAll('tbody tr');
+
+    function applyFilter(filter) {
+      var i;
+      for (i = 0; i < rows.length; i++) {
+        var tags = rows[i].getAttribute('data-tags') || '';
+        if (filter === 'all' || tags.indexOf(filter) !== -1) {
+          rows[i].style.display = '';
+        } else {
+          rows[i].style.display = 'none';
+        }
+      }
+      for (var j = 0; j < buttons.length; j++) {
+        buttons[j].classList.remove('is-active');
+        if (buttons[j].getAttribute('data-filter') === filter) {
+          buttons[j].classList.add('is-active');
+        }
+      }
+    }
+
+    for (var k = 0; k < buttons.length; k++) {
+      buttons[k].addEventListener('click', function () {
+        applyFilter(this.getAttribute('data-filter'));
+      });
+    }
+  }
+
+  function initAnchors() {
+    var tabs = document.querySelectorAll('.skai-tab');
+    if (!tabs.length) {
+      return;
+    }
+    var i;
+    for (i = 0; i < tabs.length; i++) {
+      tabs[i].addEventListener('click', function () {
+        var j;
+        for (j = 0; j < tabs.length; j++) {
+          tabs[j].classList.remove('skai-tab--active');
+        }
+        this.classList.add('skai-tab--active');
+      });
+    }
+  }
+
+  function init() {
+    bindTrackers();
+    bindFilters();
+    initAnchors();
+    loadChartJsIfNeeded(renderCharts);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
+</script>
